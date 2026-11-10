@@ -845,6 +845,19 @@ impl ListState {
 }
 
 impl StateInner {
+    /// Whether scrolling a bottom-aligned list to `top` of at most `max` reaches its end. Items
+    /// not yet measured count as no height, so the bottom of those measured is the end only when
+    /// none below it wait to be measured; items just added under a reader at the bottom would
+    /// otherwise put the reader past them.
+    fn reaches_end(&self, top: Pixels, max: Pixels) -> bool {
+        if self.alignment != ListAlignment::Bottom || top != max {
+            return false;
+        }
+        let mut cursor = self.items.cursor::<ListItemSummary>(());
+        cursor.seek(&Height(top), Bias::Right);
+        !cursor.suffix().summary().has_unknown_height
+    }
+
     fn max_scroll_offset(&self) -> Pixels {
         let bounds = self.last_layout_bounds.unwrap_or_default();
         let height = self
@@ -887,7 +900,7 @@ impl StateInner {
             .max(px(0.))
             .min(scroll_max);
 
-        if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
+        if self.reaches_end(new_scroll_top, scroll_max) {
             self.set_scroll_anchor(None);
         } else {
             let (start, ..) =
@@ -1418,7 +1431,7 @@ impl StateInner {
 
         self.follow_state.stop_following();
 
-        if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
+        if self.reaches_end(new_scroll_top, scroll_max) {
             self.set_scroll_anchor(None);
         } else {
             let (start, _, _) =
@@ -1897,6 +1910,51 @@ mod test {
         state.scroll_by(px(0.));
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 0);
+        assert_eq!(offset.offset_in_item, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_scroll_to_bottom_stops_at_unmeasured_items(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(10, crate::ListAlignment::Bottom, px(1000.));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(20.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let draw = |cx: &mut VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+                cx.new(|_| TestView(state.clone())).into_any_element()
+            });
+        };
+        let scroll = |cx: &mut VisualTestContext, delta: Pixels| {
+            cx.simulate_event(ScrollEvent {
+                position: point(px(50.), px(50.)),
+                delta: ScrollDelta::Pixels(point(px(0.), delta)),
+                ..Default::default()
+            });
+        };
+
+        draw(cx);
+        scroll(cx, px(40.));
+        draw(cx);
+        assert_eq!(state.logical_scroll_top().item_ix, 3);
+
+        // Items appended below the reader have no height until they are laid out, so
+        // scrolling to the bottom of the measured items must not jump past them.
+        state.splice(10..10, 5);
+        scroll(cx, px(-40.));
+        draw(cx);
+        let offset = state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 5);
         assert_eq!(offset.offset_in_item, px(0.));
     }
 
