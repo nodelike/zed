@@ -800,9 +800,13 @@ impl TextLayout {
             .context("prepaint has not been performed")?;
 
         let line_height = element_state.line_height;
-        let mut line_origin = bounds.origin;
         let text_style = window.text_style();
-        for line in &element_state.lines {
+        // A line's glyphs can reach past its box, so its neighbours either side paint too.
+        let shown = window.content_mask().bounds;
+        let band = (shown.top() - line_height)..(shown.bottom() + line_height);
+        for (line, line_origin) in
+            lines_within(&element_state.lines, bounds.origin, line_height, band)
+        {
             if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
                 line.paint_background(
                     line_origin,
@@ -825,7 +829,6 @@ impl TextLayout {
                 )
                 .log_err();
             }
-            line_origin.y += line.size(line_height).height;
         }
         Ok(())
     }
@@ -1276,9 +1279,97 @@ impl Element for InteractiveText {
     }
 }
 
+/// The lines of a text starting at `origin`, each with where it starts, that reach into `band`
+/// from top to bottom; a line partly inside is kept whole.
+fn lines_within(
+    lines: &[WrappedLine],
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    band: Range<Pixels>,
+) -> impl Iterator<Item = (&WrappedLine, Point<Pixels>)> {
+    let origins = lines.iter().scan(origin, move |origin, line| {
+        let this = *origin;
+        origin.y += line.size(line_height).height;
+        Some(this)
+    });
+    lines
+        .iter()
+        .zip(origins)
+        .skip_while(move |(line, origin)| origin.y + line.size(line_height).height <= band.start)
+        .take_while(move |(_, origin)| origin.y < band.end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[crate::test]
+    fn a_long_text_paints_only_the_lines_that_reach_what_shows(cx: &mut crate::TestAppContext) {
+        use crate::{point, px};
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            let text: SharedString = (0..1000).map(|n| format!("line {n}")).join("\n").into();
+            let runs = [window.text_style().to_run(text.len())];
+            let lines = window
+                .text_system()
+                .shape_text(text, px(16.), &runs, None, None)
+                .expect("shaped");
+            let height = px(20.);
+            let shown = |band: Range<Pixels>| -> Vec<(usize, Pixels)> {
+                lines_within(&lines, point(px(0.), px(-100.)), height, band)
+                    .map(|(line, origin)| {
+                        (
+                            line.text.trim_start_matches("line ").parse().unwrap(),
+                            origin.y,
+                        )
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                shown(px(105.)..px(145.)),
+                [(10, px(100.)), (11, px(120.)), (12, px(140.))],
+                "the lines cut by either edge are kept whole, where they were"
+            );
+            assert_eq!(shown(px(120.)..px(139.)), [(11, px(120.))]);
+            assert!(shown(px(30_000.)..px(31_000.)).is_empty());
+            assert_eq!(shown(px(-500.)..px(-90.)), [(0, px(-100.))]);
+            assert_eq!(shown(px(-1e6)..px(1e6)).len(), 1000);
+
+            let text = SharedString::from(format!("a\nb\n{}\nc", "word ".repeat(60)));
+            let runs = [window.text_style().to_run(text.len())];
+            let lines = window
+                .text_system()
+                .shape_text(text, px(16.), &runs, Some(px(120.)), None)
+                .expect("shaped");
+            let rows = lines[2].wrap_boundaries().len() + 1;
+            assert!(rows > 2, "the long line wraps");
+            let wrapped_top = height * 2.;
+            let second_row = wrapped_top + height + px(5.);
+            let kept: Vec<(String, Pixels)> = lines_within(
+                &lines,
+                point(px(0.), px(0.)),
+                height,
+                second_row..second_row + px(10.),
+            )
+            .map(|(line, origin)| (line.text.to_string(), origin.y))
+            .collect();
+            assert_eq!(
+                kept,
+                [(lines[2].text.to_string(), wrapped_top)],
+                "a wrapped line cut by the top edge is kept whole, from its first row"
+            );
+            let below = wrapped_top + height * rows as f32;
+            let after: Vec<Pixels> =
+                lines_within(&lines, point(px(0.), px(0.)), height, below..below + px(1.))
+                    .map(|(_, origin)| origin.y)
+                    .collect();
+            assert_eq!(
+                after,
+                [below],
+                "the line after it starts below all its rows"
+            );
+        });
+    }
 
     #[test]
     fn test_into_element_for() {
